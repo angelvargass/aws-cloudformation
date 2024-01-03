@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Load balancing with auto-scaling group attached
+
+Parameters:
+  KeyName:
+    Type: String
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+
+Resources:
+  MyLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: MyLoadBalancer
+
+  MyLaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: MyLaunchTemplate
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        ImageId: ami-079db87dc4c10ac91 # Amazon Linux AMI
+        UserData: !Base64
+          Fn::Sub: |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            echo "<h1>Hello World from $(hostname -f)</h1>" > /var/www/html/index.html
+
+  MyAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateName: MyLaunchTemplate
+        Version: !GetAtt MyLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - subnet-01fd1ba020b3f9889 # us-east-1a subnet
+      Tags:
+        - Key: Name
+          Value: MyAutoScalingInstance
+          PropagateAtLaunch: true
+
+Outputs:
+  MyLaunchTemplate:
+    Description: "Created launch template"
+    Value: !Ref MyLaunchTemplate
+
+  MyAutoScalingGroup:
+    Description: "Created auto scaling group"
+    Value: !Ref MyAutoScalingGroup
