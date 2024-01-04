@@ -3,25 +3,133 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: Load balancing with auto-scaling group attached
 
 Parameters:
-  KeyName:
+  InstanceType:
+    Description: The EC2 instance type
     Type: String
-    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+
+  KeyName:
+    Description: Name of an existing EC2 key pair to allow SSH access to the instances
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Default: ec2
+
+  LatestAmiId:
+    Description: The latest Amazon Linux 2 AMI from the Parameter Store
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+
+  OperatorEmail:
+    Description: The email address to notify when there are any scaling activities
+    Type: String
+
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+  Subnets:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: At least two public subnets in different Availability Zones in the selected VPC
+    Default: subnet-01fd1ba020b3f9889,subnet-07b82b480b1b6b9fe
+
+  VPC:
+    Type: "AWS::EC2::VPC::Id"
+    Description: A virtual private cloud (VPC) that enables resources in public subnets to connect to the internet
+    Default: vpc-06968fac19adde792
 
 Resources:
-  MyLoadBalancer:
-    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      Name: MyLoadBalancer
+      Tags:
+        - Key: "infra-stack"
+          Value: "infra-stack-ELBSecurityGroup"
+      GroupDescription: ELB Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
 
-  MyLaunchTemplate:
-    Type: "AWS::EC2::LaunchTemplate"
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      LaunchTemplateName: MyLaunchTemplate
-      VersionDescription: Initial version
+      Tags:
+        - Key: "infra-stack"
+          Value: "infra-stack-EC2SecurityGroup"
+      GroupDescription: EC2 Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId:
+            Fn::GetAtt:
+              - ELBSecurityGroup
+              - GroupId
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  EC2TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Tags:
+        - Key: "infra-stack"
+          Value: "infra-stack-EC2TargetGroup"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: "200"
+      Name: EC2TargetGroup
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "20"
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VPC
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref EC2TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Tags:
+        - Key: "infra-stack"
+          Value: "infra-stack-ApplicationLoadBalancer"
+      Scheme: internet-facing
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !GetAtt ELBSecurityGroup.GroupId
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
       LaunchTemplateData:
-        InstanceType: t2.micro
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
-        ImageId: ami-079db87dc4c10ac91 # Amazon Linux AMI
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
         UserData: !Base64
           Fn::Sub: |
             #!/bin/bash
@@ -31,27 +139,35 @@ Resources:
             systemctl enable httpd
             echo "<h1>Hello World from $(hostname -f)</h1>" > /var/www/html/index.html
 
-  MyAutoScalingGroup:
-    Type: "AWS::AutoScaling::AutoScalingGroup"
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags:
+        - Key: "infra-stack"
+          Value: "infra-stack-NotificationTopic"
+      Subscription:
+        - Endpoint: !Ref OperatorEmail
+          Protocol: email
+
+  WebServerGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
       LaunchTemplate:
-        LaunchTemplateName: MyLaunchTemplate
-        Version: !GetAtt MyLaunchTemplate.LatestVersionNumber
-      MinSize: 1
-      MaxSize: 3
-      DesiredCapacity: 2
-      VPCZoneIdentifier:
-        - subnet-01fd1ba020b3f9889 # us-east-1a subnet
-      Tags:
-        - Key: Name
-          Value: MyAutoScalingInstance
-          PropagateAtLaunch: true
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MaxSize: "3"
+      MinSize: "1"
+      NotificationConfigurations:
+        - TopicARN: !Ref NotificationTopic
+          NotificationTypes:
+            [
+              "autoscaling:EC2_INSTANCE_LAUNCH",
+              "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
+              "autoscaling:EC2_INSTANCE_TERMINATE",
+              "autoscaling:EC2_INSTANCE_TERMINATE_ERROR",
+            ]
+      TargetGroupARNs:
+        - !Ref EC2TargetGroup
+      VPCZoneIdentifier: !Ref Subnets
 
-Outputs:
-  MyLaunchTemplate:
-    Description: "Created launch template"
-    Value: !Ref MyLaunchTemplate
-
-  MyAutoScalingGroup:
-    Description: "Created auto scaling group"
-    Value: !Ref MyAutoScalingGroup
+#Outputs
