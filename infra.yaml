@@ -42,6 +42,17 @@ Parameters:
     Description: A virtual private cloud (VPC) that enables resources in public subnets to connect to the internet
     Default: vpc-06968fac19adde792
 
+  ##Deployments
+  S3BucketName:
+    Description: "S3 bucket name for the app artifacts"
+    Type: String
+    Default: infra-app-qa
+
+  CodeDeployName:
+    Description: Codedeploy Application and Deployment Group name
+    Type: String
+    Default: codedeploy-app-qa
+
 Resources:
   ELBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -120,24 +131,53 @@ Resources:
       SecurityGroups:
         - !GetAtt ELBSecurityGroup.GroupId
 
+  ##Full access from EC2 to S3
+  s3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      RoleName: EC2S3Access
+
+  #Attaching the S3 IAM Role created to the Autoscaling Instances
+  ServerProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      InstanceProfileName: cdInstanceProfile
+      Roles:
+        - !Ref s3Role
+
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
       LaunchTemplateData:
+        IamInstanceProfile:
+          Name: !Ref ServerProfile ##S3 Role attaching to each EC2 instance
         ImageId: !Ref LatestAmiId
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
         SecurityGroupIds:
           - !Ref EC2SecurityGroup
-        UserData: !Base64
-          Fn::Sub: |
+        UserData: #Script to install Codedeploy agent and enable it
+          Fn::Base64: !Sub |
             #!/bin/bash
-            yum update -y
-            yum install -y httpd
-            systemctl start httpd
-            systemctl enable httpd
-            echo "<h1>Hello World from $(hostname -f)</h1>" > /var/www/html/index.html
+            sudo apt-get update -y
+            sudo apt-get install ruby-full wget -y
+            cd /home/ubuntu
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            sudo ./install auto > /tmp/logfile
+            sudo service codedeploy-agent start
 
   NotificationTopic:
     Type: AWS::SNS::Topic
@@ -170,4 +210,61 @@ Resources:
         - !Ref EC2TargetGroup
       VPCZoneIdentifier: !Ref Subnets
 
+  ##Deployments resources
+
+  ##Code deploy service rules
+  cdRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Policies:
+        - PolicyName: codedeploy-for-launch-template
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - ec2:CreateTags
+                  - ec2:RunInstances
+                Resource: "*"
+      RoleName: CodeDeployRole
+
+  #New S3 bucket to upload source code zip file for codedeploy
+  cdS3:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+
+  #Codedeploy Application
+  cdApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Ref CodeDeployName
+      ComputePlatform: Server
+
+  #Codedeploy Deployment group
+  cdDG:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref cdApp
+      AutoScalingGroups:
+        - !Ref WebServerGroup
+      DeploymentGroupName: !Ref CodeDeployName
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+      ServiceRoleArn: !GetAtt cdRole.Arn
 #Outputs
