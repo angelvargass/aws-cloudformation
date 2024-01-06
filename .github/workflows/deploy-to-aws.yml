@@ -14,7 +14,7 @@ jobs:
       # BUILD STEPS HERE
 
       - name: Upload artifacts to S3
-        run: aws s3 cp "../.." s3://infra-app-qa/
+        run: aws s3 cp ../.. s3://infra-app-qa/
 
       - name: Deploy to CodeDeploy
         run: |
